@@ -60,7 +60,7 @@ var (
 			Name: "gpu_process_memory_used_bytes",
 			Help: "GPU memory used by a process in bytes",
 		},
-		[]string{"gpu_uuid", "gpu_name", "hostname", "pid", "username", "process_name"},
+		[]string{"gpu_uuid", "gpu_name", "hostname", "pid", "uid", "process_name"},
 	)
 )
 
@@ -126,19 +126,22 @@ func collectMetrics() {
 		}
 		for _, p := range procs {
 			pid := p.Pid
-			username := "N/A"
+			uid := "N/A"
 			procName := "N/A"
 			proc, err := process.NewProcess(int32(pid))
 			if err == nil {
 				procName, _ = proc.Name()
-				username, _ = proc.Username()
+				uids, err := proc.Uids()
+				if err == nil && len(uids) > 0 {
+					uid = fmt.Sprint(uids[0]) 
+				}
 			}
 			gpuProcessMemoryUsed.WithLabelValues(
 				uuid,
 				name,
 				hostname,
 				fmt.Sprint(pid),
-				username,
+				uid,
 				procName,
 			).Set(float64(p.UsedGpuMemory))
 		}
