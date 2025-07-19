@@ -1,5 +1,6 @@
 package main
 import (
+	"os"
 	"strings"
 	"flag"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"time"
 	"net"
 	"errors"
+	"github.com/shirou/gopsutil/v3/process"
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -19,7 +21,7 @@ var (
 			Name: "gpu_temperature_celsius",
 			Help: "GPU temperature in Celsius",
 		},
-		[]string{"gpu_uuid", "gpu_name"}, 
+		[]string{"gpu_uuid", "gpu_name", "hostname"}, 
 	)
 
 	gpuMemTotal = prometheus.NewGaugeVec(
@@ -27,7 +29,7 @@ var (
 			Name: "gpu_memory_total_bytes",
 			Help: "Total GPU memory in bytes",
 		},
-		[]string{"gpu_uuid", "gpu_name"},
+		[]string{"gpu_uuid", "gpu_name", "hostname"},
 	)
 
 	gpuMemUsed = prometheus.NewGaugeVec(
@@ -35,7 +37,7 @@ var (
 			Name: "gpu_memory_used_bytes",
 			Help: "Used GPU memory in bytes",
 		},
-		[]string{"gpu_uuid", "gpu_name"},
+		[]string{"gpu_uuid", "gpu_name", "hostname"},
 	)
 
 	gpuUtilization = prometheus.NewGaugeVec(
@@ -43,7 +45,7 @@ var (
 			Name: "gpu_utilization_percent",
 			Help: "GPU utilization percentage",
 		},
-		[]string{"gpu_uuid", "gpu_name"},
+		[]string{"gpu_uuid", "gpu_name", "hostname"},
 	)
 
 	gpuPowerUsage = prometheus.NewGaugeVec(
@@ -51,7 +53,14 @@ var (
 			Name: "gpu_power_usage_watts",
 			Help: "GPU power usage in watts",
 		},
-		[]string{"gpu_uuid", "gpu_name"},
+		[]string{"gpu_uuid", "gpu_name", "hostname"},
+	)
+	gpuProcessMemoryUsed = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "gpu_process_memory_used_bytes",
+			Help: "GPU memory used by a process in bytes",
+		},
+		[]string{"gpu_uuid", "gpu_name", "hostname", "pid", "username", "process_name"},
 	)
 )
 
@@ -61,9 +70,16 @@ func init() {
 	prometheus.MustRegister(gpuMemUsed)
 	prometheus.MustRegister(gpuUtilization)
 	prometheus.MustRegister(gpuPowerUsage)
+	prometheus.MustRegister(gpuProcessMemoryUsed)
 }
 
 func collectMetrics() {
+	gpuProcessMemoryUsed.Reset()
+	hostname, err := os.Hostname()
+    	if err != nil {
+        	log.Printf("Error getting hostname: %v", err)
+        	hostname = "unknown"
+    	}
 	count, ret := nvml.DeviceGetCount()
 	if ret != nvml.SUCCESS {
 		log.Printf("Error getting device count: %v", nvml.ErrorString(ret))
@@ -86,23 +102,45 @@ func collectMetrics() {
 
 		temp, ret := device.GetTemperature(nvml.TEMPERATURE_GPU)
 		if ret == nvml.SUCCESS {
-			gpuTemp.WithLabelValues(uuid, name).Set(float64(temp))
+			gpuTemp.WithLabelValues(uuid, name, hostname).Set(float64(temp))
 		}
 
 		memInfo, ret := device.GetMemoryInfo()
 		if ret == nvml.SUCCESS {
-			gpuMemTotal.WithLabelValues(uuid, name).Set(float64(memInfo.Total))
-			gpuMemUsed.WithLabelValues(uuid, name).Set(float64(memInfo.Used))
+			gpuMemTotal.WithLabelValues(uuid, name, hostname).Set(float64(memInfo.Total))
+			gpuMemUsed.WithLabelValues(uuid, name, hostname).Set(float64(memInfo.Used))
 		}
 
 		util, ret := device.GetUtilizationRates()
 		if ret == nvml.SUCCESS {
-			gpuUtilization.WithLabelValues(uuid, name).Set(float64(util.Gpu))
+			gpuUtilization.WithLabelValues(uuid, name, hostname).Set(float64(util.Gpu))
 		}
 
 		power, ret := device.GetPowerUsage()
 		if ret == nvml.SUCCESS {
-			gpuPowerUsage.WithLabelValues(uuid, name).Set(float64(power) / 1000.0)
+			gpuPowerUsage.WithLabelValues(uuid, name, hostname).Set(float64(power) / 1000.0)
+		}
+		procs, ret := device.GetComputeRunningProcesses()
+		if ret != nvml.SUCCESS {
+			continue
+		}
+		for _, p := range procs {
+			pid := p.Pid
+			username := "N/A"
+			procName := "N/A"
+			proc, err := process.NewProcess(int32(pid))
+			if err == nil {
+				procName, _ = proc.Name()
+				username, _ = proc.Username()
+			}
+			gpuProcessMemoryUsed.WithLabelValues(
+				uuid,
+				name,
+				hostname,
+				fmt.Sprint(pid),
+				username,
+				procName,
+			).Set(float64(p.UsedGpuMemory))
 		}
 	}
 	log.Println("Metrics collected.")
@@ -143,7 +181,7 @@ func main() {
 
 	localIP, err := getLocalIP()
 	if err != nil {
-		log.Fatalf("로컬 IP를 가져오는 데 실패했습니다: %v", err)
+		log.Fatalf("Failed to get local IP: %v", err)
 	}
 
 	ret := nvml.Init()
