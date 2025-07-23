@@ -1,5 +1,6 @@
 package main
 import (
+	"context"
 	"os"
 	"strings"
 	"flag"
@@ -13,6 +14,10 @@ import (
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+    	"k8s.io/client-go/tools/clientcmd"
+    	"path/filepath"
 )
 var (
 	// define prometheus metrics
@@ -62,6 +67,13 @@ var (
 		},
 		[]string{"gpu_uuid", "gpu_name", "hostname", "pid", "uid", "process_name"},
 	)
+	k8sNamespacePodCount = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "k8s_namespace_pod_count_total",
+			Help: "Total number of pods in each namespace",
+		},
+		[]string{"namespace", "hostname"},
+	)
 )
 
 func init() {
@@ -71,6 +83,7 @@ func init() {
 	prometheus.MustRegister(gpuUtilization)
 	prometheus.MustRegister(gpuPowerUsage)
 	prometheus.MustRegister(gpuProcessMemoryUsed)
+	prometheus.MustRegister(k8sNamespacePodCount)
 }
 
 func collectMetrics() {
@@ -146,6 +159,21 @@ func collectMetrics() {
 			).Set(float64(p.UsedGpuMemory))
 		}
 	}
+	if clientset != nil {
+		k8sNamespacePodCount.Reset()
+		pods, err := clientset.CoreV1().Pods("").List(context.Background(), metav1.ListOptions{})
+		if err == nil {
+			podCountByNamespace := make(map[string]int)
+			for _, pod := range pods.Items {
+				podCountByNamespace[pod.Namespace]++
+			}
+			for namespace, count := range podCountByNamespace {
+				k8sNamespacePodCount.WithLabelValues(namespace, hostname).Set(float64(count))
+			}
+		} else {
+			log.Printf("Failed to get K8s pods info: %v", err)
+		}
+	}
 	log.Println("Metrics collected.")
 }
 
@@ -177,7 +205,7 @@ func getLocalIP() (string, error) {
 	}
 	return "", errors.New("can't find available local ip address")
 }
-
+var clientset *kubernetes.Clientset
 func main() {
 	port := flag.Int("port", 8080, "metrics port to listen on")
 	flag.Parse()
@@ -192,7 +220,17 @@ func main() {
 		log.Fatalf("Failed to initialize NVML: %v", nvml.ErrorString(ret))
 	}
 	defer nvml.Shutdown()
-
+	
+	kubeconfigPath := filepath.Join(os.Getenv("HOME"), ".kube", "config")
+    	config, err := clientcmd.BuildConfigFromFlags("", kubeconfigPath)
+    	if err != nil {
+        	log.Printf("Failed to load Kubeconfig: %v ", err)
+    	} else {
+        	clientset, err = kubernetes.NewForConfig(config)
+        	if err != nil {
+            		log.Printf("Failed to create K8s clientset: %v", err)
+        	}
+    	}
 	go func() {
 		for {
 			collectMetrics()
